@@ -132,6 +132,8 @@ pub use crate::common::{AnyExtension, DisposalMethod, Extension, Frame};
 
 pub use crate::reader::{ColorOutput, MemoryLimit};
 pub use crate::reader::{DecodeOptions, Decoder, Version};
+// photo-gallery: a decoder's buffers, kept from one image to the next.
+pub use crate::reader::Scratch;
 pub use crate::reader::{DecodingError, DecodingFormatError};
 
 pub use crate::encoder::{Encoder, EncodingError, EncodingFormatError, ExtensionData, Repeat};
@@ -142,7 +144,14 @@ pub mod streaming_decoder {
     pub use crate::reader::{Decoded, FrameDataType, FrameDecoder, OutputBuffer, StreamingDecoder};
 }
 
+#[cfg(feature = "color_quant")]
+macro_rules! insert_as_doc {
+    { $content:expr } => {
+        #[allow(unused_doc_comments)]
+        #[doc = $content] extern "C" { }
+    }
+}
+
 // Provides the README.md as doc, to ensure the example works!
-#[cfg(all(doctest, feature = "color_quant"))]
-#[doc = include_str!("../README.md")]
-mod _readme {}
+#[cfg(feature = "color_quant")]
+insert_as_doc!(include_str!("../README.md"));

@@ -1,4 +1,4 @@
-use criterion::{BenchmarkGroup, BenchmarkId, Criterion, Throughput, measurement::Measurement};
+use criterion::{measurement::Measurement, BenchmarkGroup, BenchmarkId, Criterion, Throughput};
 use gif::Decoder;
 use std::hint::black_box;
 

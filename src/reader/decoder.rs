@@ -10,11 +10,11 @@ use core::num::NonZeroUsize;
 use std::error;
 use std::io;
 
-use crate::MemoryLimit;
 use crate::common::{AnyExtension, Block, DisposalMethod, Extension, Frame};
 use crate::reader::DecodeOptions;
+use crate::MemoryLimit;
 
-use weezl::{BitOrder, LzwError, LzwStatus, decode::Decoder as LzwDecoder};
+use weezl::{decode::Decoder as LzwDecoder, BitOrder, LzwError, LzwStatus};
 
 /// GIF palettes are RGB
 pub const PLTE_CHANNELS: usize = 3;
@@ -57,8 +57,6 @@ pub enum DecodingError {
     LzwError(LzwError),
     /// Returned if the image is found to be malformed.
     Format(DecodingFormatError),
-    /// Image truncated. The unfilled output buffer has been zeroed and is safe to use.
-    Truncated,
     /// Wraps `std::io::Error`.
     Io(io::Error),
 }
@@ -81,7 +79,6 @@ impl fmt::Display for DecodingError {
             Self::DecoderNotFound => fmt.write_str("Decoder Not Found"),
             Self::EndCodeNotFound => fmt.write_str("End-Code Not Found"),
             Self::UnexpectedEof => fmt.write_str("Unexpected End of File"),
-            Self::Truncated => fmt.write_str("Image truncated"),
             Self::LzwError(ref err) => err.fmt(fmt),
             Self::Format(ref d) => d.fmt(fmt),
             Self::Io(ref err) => err.fmt(fmt),
@@ -101,7 +98,6 @@ impl error::Error for DecodingError {
             Self::LzwError(ref err) => Some(err),
             Self::Format(ref err) => Some(err),
             Self::Io(ref err) => Some(err),
-            Self::Truncated => None,
         }
     }
 }
@@ -146,7 +142,10 @@ pub enum Decoded {
     /// Decoded nothing.
     Nothing,
     /// Global palette.
-    GlobalPalette(Box<[u8]>),
+    ///
+    /// photo-gallery: a `Vec` (upstream: a boxed slice, made with `into_boxed_slice`, which would reallocate a kept
+    /// buffer to its length).
+    GlobalPalette(Vec<u8>),
     /// Index of the background color in the global palette.
     BackgroundColor(u8),
     /// Palette and optional `Application` extension have been parsed,
@@ -276,19 +275,40 @@ impl FrameDecoder {
     }
 }
 
+/// photo-gallery: LZW decoders, one per minimum code size (1 to 11), kept for when that size comes again.
+pub(crate) type LzwDecoders = [Option<LzwDecoder>; 12];
+
 struct LzwReader {
     decoder: Option<LzwDecoder>,
     min_code_size: u8,
     check_for_end_code: bool,
+    /// photo-gallery: the decoders of the other code sizes, reset for reuse (weezl's `reset` gives a decoder as
+    /// `new` makes it, keeping its tables) instead of made anew.
+    spare: LzwDecoders,
 }
 
 impl LzwReader {
     pub fn new(check_for_end_code: bool) -> Self {
+        Self::with_decoders(check_for_end_code, Default::default())
+    }
+
+    /// photo-gallery: [`Self::new`] with decoders kept from an earlier reader ([`Self::into_decoders`]). Like a new
+    /// one, it has no current decoder until `reset`.
+    fn with_decoders(check_for_end_code: bool, spare: LzwDecoders) -> Self {
         Self {
             decoder: None,
             min_code_size: 0,
             check_for_end_code,
+            spare,
         }
+    }
+
+    /// photo-gallery: every decoder, the current one included.
+    fn into_decoders(mut self) -> LzwDecoders {
+        if let Some(decoder) = self.decoder.take() {
+            self.spare[usize::from(self.min_code_size)] = Some(decoder);
+        }
+        self.spare
     }
 
     pub fn check_code_size(min_code_size: u8) -> Result<(), DecodingError> {
@@ -305,8 +325,18 @@ impl LzwReader {
 
         // The decoder can be reused if the code size stayed the same
         if self.min_code_size != min_code_size || self.decoder.is_none() {
+            // photo-gallery: the current decoder kept, and one of this size reset if there is one.
+            if let Some(decoder) = self.decoder.take() {
+                self.spare[usize::from(self.min_code_size)] = Some(decoder);
+            }
             self.min_code_size = min_code_size;
-            self.decoder = Some(LzwDecoder::new(BitOrder::Lsb, min_code_size));
+            self.decoder = Some(match self.spare[usize::from(min_code_size)].take() {
+                Some(mut decoder) => {
+                    decoder.reset();
+                    decoder
+                }
+                None => LzwDecoder::new(BitOrder::Lsb, min_code_size),
+            });
         } else {
             self.decoder
                 .as_mut()
@@ -318,7 +348,7 @@ impl LzwReader {
     }
 
     pub fn has_ended(&self) -> bool {
-        self.decoder.as_ref().is_none_or(|e| e.has_ended())
+        self.decoder.as_ref().map_or(true, |e| e.has_ended())
     }
 
     pub fn decode_bytes(
@@ -384,6 +414,44 @@ pub struct StreamingDecoder {
     current: Option<Frame<'static>>,
     /// Needs to emit `HeaderEnd` once
     header_end_reached: bool,
+    /// photo-gallery: local palettes to read the next ones in.
+    palettes: Vec<Vec<u8>>,
+}
+
+/// photo-gallery: a streaming decoder's buffers, kept from one image to the next.
+#[derive(Default)]
+pub(crate) struct StreamBuffers {
+    lzw: LzwDecoders,
+    ext: Vec<u8>,
+    global_palette: Vec<u8>,
+    pub(crate) palettes: Vec<Vec<u8>>,
+}
+
+impl StreamBuffers {
+    /// The global palette, if it holds more than the one kept (a decoder's, given the palette when it was read).
+    pub(crate) fn keep_global_palette(&mut self, palette: Vec<u8>) {
+        if palette.capacity() > self.global_palette.capacity() {
+            self.global_palette = palette;
+        }
+    }
+
+    /// A local palette; two are kept at most (the frame being read and the one before).
+    pub(crate) fn keep_palette(&mut self, palette: Vec<u8>) {
+        if self.palettes.len() < 2 {
+            self.palettes.push(palette);
+        }
+    }
+
+    /// Free the buffers that hold more than `bytes`.
+    pub(crate) fn trim(&mut self, bytes: usize) {
+        if self.ext.capacity() > bytes {
+            self.ext = Vec::new();
+        }
+        if self.global_palette.capacity() > bytes {
+            self.global_palette = Vec::new();
+        }
+        self.palettes.retain(|palette| palette.capacity() <= bytes);
+    }
 }
 
 /// One version number of the GIF standard.
@@ -448,11 +516,26 @@ impl StreamingDecoder {
     }
 
     pub(crate) fn with_options(options: &DecodeOptions) -> Self {
+        Self::with_buffers(options, StreamBuffers::default())
+    }
+
+    /// photo-gallery: [`Self::with_options`] in buffers kept from an earlier decoder ([`Self::into_buffers`]),
+    /// emptied, so that they read as new ones.
+    pub(crate) fn with_buffers(options: &DecodeOptions, buffers: StreamBuffers) -> Self {
+        let StreamBuffers {
+            lzw,
+            mut ext,
+            mut global_palette,
+            palettes,
+        } = buffers;
+        ext.clear();
+        ext.reserve(256); // 0xFF + 1 byte length
+        global_palette.clear();
         Self {
             internal_buffer: [0; 9],
             unused_internal_buffer_len: 0,
             state: Magic,
-            lzw_reader: LzwReader::new(options.check_for_end_code),
+            lzw_reader: LzwReader::with_decoders(options.check_for_end_code, lzw),
             skip_frame_decoding: options.skip_frame_decoding,
             check_frame_consistency: options.check_frame_consistency,
             allow_unknown_blocks: options.allow_unknown_blocks,
@@ -460,14 +543,36 @@ impl StreamingDecoder {
             version: Version::V87a,
             width: 0,
             height: 0,
-            global_color_table: Vec::new(),
+            global_color_table: global_palette,
             ext: ExtensionData {
                 id: AnyExtension(0),
-                data: Vec::with_capacity(256), // 0xFF + 1 byte length
+                data: ext,
             },
             current: None,
             header_end_reached: false,
+            palettes,
         }
+    }
+
+    /// photo-gallery: a local palette to read the next ones in.
+    pub(crate) fn keep_palette(&mut self, palette: Vec<u8>) {
+        if self.palettes.len() < 2 {
+            self.palettes.push(palette);
+        }
+    }
+
+    /// photo-gallery: the buffers, for [`Self::with_buffers`].
+    pub(crate) fn into_buffers(self) -> StreamBuffers {
+        let mut buffers = StreamBuffers {
+            lzw: self.lzw_reader.into_decoders(),
+            ext: self.ext.data,
+            global_palette: self.global_color_table,
+            palettes: self.palettes,
+        };
+        if let Some(palette) = self.current.and_then(|frame| frame.palette) {
+            buffers.keep_palette(palette);
+        }
+        buffers
     }
 
     /// Updates the internal state of the decoder.
@@ -660,9 +765,15 @@ impl StreamingDecoder {
                 if local_table {
                     let table_size = flags & 0b0000_0111;
                     let pal_len = PLTE_CHANNELS * (1 << (table_size + 1));
+                    // photo-gallery: in a kept palette, emptied (upstream: `Vec::new`).
+                    let palettes = &mut self.palettes;
                     frame
                         .palette
-                        .get_or_insert_with(Vec::new)
+                        .get_or_insert_with(|| {
+                            let mut palette = palettes.pop().unwrap_or_default();
+                            palette.clear();
+                            palette
+                        })
                         .try_reserve_exact(pal_len)
                         .map_err(|_| DecodingError::OutOfMemory)?;
                     goto!(consumed, LocalPalette(pal_len))
@@ -680,7 +791,7 @@ impl StreamingDecoder {
                     goto!(n, GlobalPalette(left - n))
                 } else {
                     goto!(BlockStart(b), emit Decoded::GlobalPalette(
-                        mem::take(&mut self.global_color_table).into_boxed_slice()
+                        mem::take(&mut self.global_color_table)
                     ))
                 }
             }

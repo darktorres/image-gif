@@ -1,5 +1,0 @@
-target
-*.sublime-*
-.*
-!.github
-Cargo.lock

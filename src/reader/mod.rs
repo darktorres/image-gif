@@ -2,6 +2,7 @@ use alloc::borrow::Cow;
 use alloc::vec::Vec;
 use core::convert::{TryFrom, TryInto};
 use core::iter::FusedIterator;
+use core::marker::PhantomData;
 use core::mem;
 use core::num::NonZeroU64;
 use std::io;
@@ -15,11 +16,51 @@ mod decoder;
 
 pub use self::decoder::{
     Decoded, DecodingError, DecodingFormatError, FrameDataType, FrameDecoder, OutputBuffer,
-    PLTE_CHANNELS, StreamingDecoder, Version,
+    StreamingDecoder, Version, PLTE_CHANNELS,
 };
 
 pub use self::converter::ColorOutput;
 use self::converter::PixelConverter;
+use self::decoder::StreamBuffers;
+
+/// photo-gallery: what a decoder allocates as it reads a GIF (the LZW decoders and their tables, one per code size,
+/// the extension buffer, the palettes, the indices it converts to RGBA, a frame's buffer, XMP and ICC), kept from
+/// one image to the next: [`DecodeOptions::read_info_with`], [`Decoder::into_scratch`]. A decoder reads in them
+/// exactly as in new ones.
+#[derive(Default)]
+pub struct Scratch {
+    stream: StreamBuffers,
+    converter: Vec<u8>,
+    frame: Vec<u8>,
+    xmp: Vec<u8>,
+    icc: Vec<u8>,
+}
+
+impl Scratch {
+    /// Free the buffers that hold more than `bytes`, after an image far larger than the rest.
+    pub fn trim(&mut self, bytes: usize) {
+        self.stream.trim(bytes);
+        for buf in [
+            &mut self.converter,
+            &mut self.frame,
+            &mut self.xmp,
+            &mut self.icc,
+        ] {
+            if buf.capacity() > bytes {
+                *buf = Vec::new();
+            }
+        }
+    }
+}
+
+/// photo-gallery: of two buffers, the larger.
+fn larger(a: Vec<u8>, b: Vec<u8>) -> Vec<u8> {
+    if a.capacity() >= b.capacity() {
+        a
+    } else {
+        b
+    }
+}
 
 #[derive(Clone, Debug)]
 /// The maximum amount of memory the decoder is allowed to use for each frame
@@ -108,6 +149,8 @@ pub struct DecodeOptions {
     skip_frame_decoding: bool,
     check_for_end_code: bool,
     allow_unknown_blocks: bool,
+    // photo-gallery: see `Self::skip_metadata`.
+    skip_metadata: bool,
 }
 
 impl Default for DecodeOptions {
@@ -128,6 +171,7 @@ impl DecodeOptions {
             skip_frame_decoding: false,
             check_for_end_code: false,
             allow_unknown_blocks: false,
+            skip_metadata: false,
         }
     }
 
@@ -168,6 +212,17 @@ impl DecodeOptions {
         self.skip_frame_decoding = skip;
     }
 
+    /// photo-gallery: configure whether to skip the XMP and ICC application extensions.
+    ///
+    /// The default is false.
+    ///
+    /// When turned on, they are skipped like unknown application extensions: [`Decoder::xmp_metadata`] and
+    /// [`Decoder::icc_profile`] are `None`, and their bytes are neither collected nor counted against the memory
+    /// limit. For callers that read a file's metadata themselves.
+    pub fn skip_metadata(&mut self, skip: bool) {
+        self.skip_metadata = skip;
+    }
+
     /// Configure if LZW encoded blocks must end with a marker end code.
     ///
     /// The default is `false`.
@@ -206,17 +261,34 @@ impl DecodeOptions {
     ///
     /// Returns a [`Decoder`]. All decoder configuration has to be done beforehand.
     pub fn read_info<R: Read>(self, r: R) -> Result<Decoder<R>, DecodingError> {
-        Decoder::with_no_init(r, StreamingDecoder::with_options(&self), self).init()
+        Decoder::<R>::with_no_init(io::BufReader::new(r), self, Scratch::default()).init()
+    }
+
+    /// photo-gallery: [`Self::read_info`] in the buffers of an earlier decoder ([`Decoder::into_scratch`]), which
+    /// come back with the error if the headers can't be read. `r` is read as it is, without a `BufReader` around it
+    /// (which upstream allocates for each decoder, then copies the file through): it must be buffered itself, a
+    /// `Cursor` over a file in memory or a `BufReader`.
+    pub fn read_info_with<B: BufRead>(
+        self,
+        r: B,
+        scratch: Scratch,
+    ) -> Result<Decoder<B, B>, (DecodingError, Scratch)> {
+        let mut decoder = Decoder::with_no_init(r, self, scratch);
+        match decoder.read_headers() {
+            Ok(()) => Ok(decoder),
+            Err(err) => Err((err, decoder.into_scratch())),
+        }
     }
 }
 
-struct ReadDecoder<R: Read> {
-    reader: io::BufReader<R>,
+// photo-gallery: over any buffered reader (upstream: a `BufReader` it made).
+struct ReadDecoder<B: BufRead> {
+    reader: B,
     decoder: StreamingDecoder,
     at_eof: bool,
 }
 
-impl<R: Read> ReadDecoder<R> {
+impl<B: BufRead> ReadDecoder<B> {
     #[inline(never)]
     fn decode_next(
         &mut self,
@@ -243,7 +315,7 @@ impl<R: Read> ReadDecoder<R> {
         Ok(None)
     }
 
-    fn into_inner(self) -> io::BufReader<R> {
+    fn into_inner(self) -> B {
         self.reader
     }
 
@@ -259,10 +331,8 @@ impl<R: Read> ReadDecoder<R> {
 const EXT_NAME_NETSCAPE: &[u8] = b"NETSCAPE2.0";
 const EXT_NAME_XMP: &[u8] = b"XMP DataXMP";
 const EXT_NAME_ICC: &[u8] = b"ICCRGBG1012";
-const EXT_NAME_MAGICK_8BIM: &[u8] = b"MGK8BIM0000";
 
 /// State when parsing application extension
-#[derive(Debug)]
 enum AppExtensionState {
     /// Waiting for app name
     None,
@@ -270,13 +340,15 @@ enum AppExtensionState {
     Xmp,
     Icc,
     Skip,
-    Magick8Bim,
 }
 
 #[allow(dead_code)]
 /// GIF decoder. Create [`DecodeOptions`] to get started, and call [`DecodeOptions::read_info`].
-pub struct Decoder<R: Read> {
-    decoder: ReadDecoder<R>,
+///
+/// photo-gallery: `B` is the buffered reader it reads `R` through: a `BufReader` it makes ([`DecodeOptions::read_info`])
+/// or, `R` being buffered itself, `R` ([`DecodeOptions::read_info_with`]).
+pub struct Decoder<R: Read, B: BufRead = io::BufReader<R>> {
+    decoder: ReadDecoder<B>,
     pixel_converter: PixelConverter,
     memory_limit: MemoryLimit,
     bg_color: Option<u8>,
@@ -288,8 +360,13 @@ pub struct Decoder<R: Read> {
     xmp_metadata: Option<Vec<u8>>,
     /// ICC profile bytes.
     icc_profile: Option<Vec<u8>>,
-    /// 8BIM (Photoshop) profile bytes as encoded by imagemagick.
-    magick_8bim_profile: Option<Vec<u8>>,
+    /// photo-gallery: the buffer of the frame before, and XMP and ICC vectors, to read the next ones in.
+    spare_frame: Vec<u8>,
+    spare_xmp: Vec<u8>,
+    spare_icc: Vec<u8>,
+    /// photo-gallery: `DecodeOptions::skip_metadata`.
+    skip_metadata: bool,
+    source: PhantomData<R>,
 }
 
 impl<R> Decoder<R>
@@ -308,28 +385,73 @@ where
     pub fn build() -> DecodeOptions {
         DecodeOptions::new()
     }
+}
 
-    fn with_no_init(reader: R, decoder: StreamingDecoder, options: DecodeOptions) -> Self {
+impl<R, B> Decoder<R, B>
+where
+    R: Read,
+    B: BufRead,
+{
+    // photo-gallery: over `reader` as it is, in the buffers of `scratch`.
+    fn with_no_init(reader: B, options: DecodeOptions, scratch: Scratch) -> Self {
+        let Scratch {
+            stream,
+            converter,
+            frame,
+            xmp,
+            icc,
+        } = scratch;
         Self {
             decoder: ReadDecoder {
-                reader: io::BufReader::new(reader),
-                decoder,
+                reader,
+                decoder: StreamingDecoder::with_buffers(&options, stream),
                 at_eof: false,
             },
             bg_color: None,
-            pixel_converter: PixelConverter::new(options.color_output),
+            pixel_converter: PixelConverter::with_buffer(options.color_output, converter),
             memory_limit: options.memory_limit.clone(),
             repeat: Repeat::default(),
             current_frame: Frame::default(),
             current_frame_data_type: FrameDataType::Pixels,
             app_extension_state: AppExtensionState::None,
+            skip_metadata: options.skip_metadata,
             xmp_metadata: None,
             icc_profile: None,
-            magick_8bim_profile: None,
+            spare_frame: frame,
+            spare_xmp: xmp,
+            spare_icc: icc,
+            source: PhantomData,
+        }
+    }
+
+    /// photo-gallery: the buffers, for [`DecodeOptions::read_info_with`].
+    pub fn into_scratch(self) -> Scratch {
+        let mut stream = self.decoder.decoder.into_buffers();
+        let (converter, global_palette) = self.pixel_converter.into_buffers();
+        stream.keep_global_palette(global_palette);
+        if let Some(palette) = self.current_frame.palette {
+            stream.keep_palette(palette);
+        }
+        let frame = match self.current_frame.buffer {
+            Cow::Owned(buffer) => larger(buffer, self.spare_frame),
+            Cow::Borrowed(_) => self.spare_frame,
+        };
+        Scratch {
+            stream,
+            converter,
+            frame,
+            xmp: larger(self.xmp_metadata.unwrap_or_default(), self.spare_xmp),
+            icc: larger(self.icc_profile.unwrap_or_default(), self.spare_icc),
         }
     }
 
     fn init(mut self) -> Result<Self, DecodingError> {
+        self.read_headers()?;
+        Ok(self)
+    }
+
+    // photo-gallery: `init`'s work, the decoder borrowed, so that a failure can give its buffers back.
+    fn read_headers(&mut self) -> Result<(), DecodingError> {
         const APP_EXTENSION: AnyExtension = AnyExtension(Extension::Application as u8);
         loop {
             match self.decoder.decode_next(&mut OutputBuffer::None)? {
@@ -337,7 +459,7 @@ where
                     self.bg_color = Some(bg_color);
                 }
                 Some(Decoded::GlobalPalette(palette)) => {
-                    self.pixel_converter.set_global_palette(palette.into());
+                    self.pixel_converter.set_global_palette(palette);
                 }
                 Some(Decoded::SubBlock {
                     ext: APP_EXTENSION,
@@ -353,7 +475,7 @@ where
                 None => {
                     return Err(DecodingError::format(
                         "file does not contain any image data",
-                    ));
+                    ))
                 }
             }
         }
@@ -363,7 +485,7 @@ where
                 self.bg_color = None;
             }
         }
-        Ok(self)
+        Ok(())
     }
 
     fn read_application_extension(&mut self, is_last: bool) -> Result<(), DecodingError> {
@@ -373,17 +495,21 @@ where
                 // GIF spec requires len == 11
                 self.app_extension_state = match data {
                     EXT_NAME_NETSCAPE => AppExtensionState::Netscape,
-                    EXT_NAME_XMP => {
-                        self.xmp_metadata = Some(Vec::new());
+                    // photo-gallery: in a kept vector, emptied (upstream: `Vec::new`).
+                    // photo-gallery: unless asked not to (`DecodeOptions::skip_metadata`).
+                    EXT_NAME_XMP if !self.skip_metadata => {
+                        let mut xmp = (self.xmp_metadata.take())
+                            .unwrap_or_else(|| mem::take(&mut self.spare_xmp));
+                        xmp.clear();
+                        self.xmp_metadata = Some(xmp);
                         AppExtensionState::Xmp
                     }
-                    EXT_NAME_ICC => {
-                        self.icc_profile = Some(Vec::new());
+                    EXT_NAME_ICC if !self.skip_metadata => {
+                        let mut icc = (self.icc_profile.take())
+                            .unwrap_or_else(|| mem::take(&mut self.spare_icc));
+                        icc.clear();
+                        self.icc_profile = Some(icc);
                         AppExtensionState::Icc
-                    }
-                    EXT_NAME_MAGICK_8BIM => {
-                        self.magick_8bim_profile = Some(Vec::new());
-                        AppExtensionState::Magick8Bim
                     }
                     _ => AppExtensionState::Skip,
                 }
@@ -430,12 +556,6 @@ where
                     icc.extend_from_slice(data);
                 }
             }
-            AppExtensionState::Magick8Bim => {
-                if let Some(profile) = &mut self.magick_8bim_profile {
-                    self.memory_limit.try_reserve(profile, data.len())?;
-                    profile.extend_from_slice(data);
-                }
-            }
             AppExtensionState::Skip => {}
         };
         if is_last {
@@ -449,7 +569,15 @@ where
         loop {
             match self.decoder.decode_next(&mut OutputBuffer::None)? {
                 Some(Decoded::FrameMetadata(frame_data_type)) => {
-                    self.current_frame = self.decoder.decoder.current_frame_mut().take();
+                    let frame = self.decoder.decoder.current_frame_mut().take();
+                    // photo-gallery: the frame before's palette and buffer kept for the next ones.
+                    let before = mem::replace(&mut self.current_frame, frame);
+                    if let Some(palette) = before.palette {
+                        self.decoder.decoder.keep_palette(palette);
+                    }
+                    if let Cow::Owned(buffer) = before.buffer {
+                        self.spare_frame = larger(buffer, mem::take(&mut self.spare_frame));
+                    }
                     self.current_frame_data_type = frame_data_type;
                     if self.current_frame.palette.is_none() && self.global_palette().is_none() {
                         return Err(DecodingError::format(
@@ -484,6 +612,13 @@ where
     /// You can also call `.into_iter()` on the decoder to use it as a regular iterator.
     pub fn read_next_frame(&mut self) -> Result<Option<&Frame<'static>>, DecodingError> {
         if self.next_frame_info()?.is_some() {
+            // photo-gallery: the frame read in the buffer of the one before, emptied, which both kinds below
+            // fill as they would a new one (zeroed to the frame's size, or appended to).
+            if let Cow::Borrowed(_) = self.current_frame.buffer {
+                let mut buffer = mem::take(&mut self.spare_frame);
+                buffer.clear();
+                self.current_frame.buffer = Cow::Owned(buffer);
+            }
             match self.current_frame_data_type {
                 FrameDataType::Pixels => {
                     self.pixel_converter.read_frame(
@@ -563,12 +698,10 @@ where
     /// `Self::next_frame_info` needs to be called beforehand. Returns `true` if the supplied
     /// buffer could be filled completely. Should not be called after `false` had been returned.
     pub fn fill_buffer(&mut self, buf: &mut [u8]) -> Result<bool, DecodingError> {
-        let filled = self
-            .pixel_converter
+        self.pixel_converter
             .fill_buffer(&self.current_frame, buf, &mut |out| {
                 self.decoder.decode_next_bytes(out)
-            })?;
-        Ok(filled == buf.len())
+            })
     }
 
     /// Output buffer size
@@ -625,17 +758,8 @@ where
         self.icc_profile.as_deref()
     }
 
-    /// Photoshop Image Resource Block stored in the image.
-    #[inline]
-    #[must_use]
-    #[doc(alias = "8BIM")]
-    #[doc(alias = "image resource block")]
-    pub fn photoshop_irb(&self) -> Option<&[u8]> {
-        self.magick_8bim_profile.as_deref()
-    }
-
     /// Abort decoding and recover the `io::Read` instance
-    pub fn into_inner(self) -> io::BufReader<R> {
+    pub fn into_inner(self) -> B {
         self.decoder.into_inner()
     }
 
@@ -654,9 +778,9 @@ where
     }
 }
 
-impl<R: Read> IntoIterator for Decoder<R> {
+impl<R: Read, B: BufRead> IntoIterator for Decoder<R, B> {
     type Item = Result<Frame<'static>, DecodingError>;
-    type IntoIter = DecoderIter<R>;
+    type IntoIter = DecoderIter<R, B>;
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
@@ -668,23 +792,23 @@ impl<R: Read> IntoIterator for Decoder<R> {
 }
 
 /// Use `decoder.into_iter()` to iterate over the frames
-pub struct DecoderIter<R: Read> {
-    inner: Decoder<R>,
+pub struct DecoderIter<R: Read, B: BufRead = io::BufReader<R>> {
+    inner: Decoder<R, B>,
     ended: bool,
 }
 
-impl<R: Read> DecoderIter<R> {
+impl<R: Read, B: BufRead> DecoderIter<R, B> {
     /// Abort decoding and recover the `io::Read` instance
     ///
     /// Use `for frame in iter.by_ref()` to be able to call this afterwards.
-    pub fn into_inner(self) -> io::BufReader<R> {
+    pub fn into_inner(self) -> B {
         self.inner.into_inner()
     }
 }
 
-impl<R: Read> FusedIterator for DecoderIter<R> {}
+impl<R: Read, B: BufRead> FusedIterator for DecoderIter<R, B> {}
 
-impl<R: Read> Iterator for DecoderIter<R> {
+impl<R: Read, B: BufRead> Iterator for DecoderIter<R, B> {
     type Item = Result<Frame<'static>, DecodingError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -702,6 +826,546 @@ impl<R: Read> Iterator for DecoderIter<R> {
             }
         } else {
             None
+        }
+    }
+}
+
+/// photo-gallery: a decoder in kept buffers ([`Scratch`]), over a reader given as it is, reads as a new one over
+/// its own `BufReader`, whatever it read before.
+#[cfg(test)]
+mod photo_gallery {
+    use super::*;
+    use alloc::format;
+    use alloc::string::String;
+    use alloc::vec;
+    use std::io::{BufReader, Cursor};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    /// A pseudo-random generator, so that the files are the same from run to run.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u8 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u8
+        }
+
+        fn bytes(&mut self, len: usize) -> Vec<u8> {
+            (0..len).map(|_| self.next()).collect()
+        }
+    }
+
+    #[derive(Clone)]
+    struct FrameSpec {
+        left: u16,
+        top: u16,
+        width: u16,
+        height: u16,
+        /// The local palette's size in bits (2 to the bits colours).
+        local: Option<u8>,
+        interlaced: bool,
+        transparent: Option<u8>,
+        code_size: u8,
+        /// Indices are below this (past the palette when larger than it).
+        below: u16,
+    }
+
+    fn frame(width: u16, height: u16, code_size: u8) -> FrameSpec {
+        FrameSpec {
+            left: 0,
+            top: 0,
+            width,
+            height,
+            local: None,
+            interlaced: false,
+            transparent: None,
+            code_size,
+            below: 1 << code_size.min(8),
+        }
+    }
+
+    fn sub_blocks(out: &mut Vec<u8>, data: &[u8]) {
+        for block in data.chunks(255) {
+            out.push(block.len() as u8);
+            out.extend_from_slice(block);
+        }
+        out.push(0);
+    }
+
+    fn application(name: &[u8; 11], data: &[u8]) -> Vec<u8> {
+        let mut ext = vec![0x21, 0xff, 11];
+        ext.extend_from_slice(name);
+        sub_blocks(&mut ext, data);
+        ext
+    }
+
+    /// XMP as GIFs hold it: the text as it is, then the 258-byte "magic trailer", then a terminator.
+    fn xmp(text: &[u8]) -> Vec<u8> {
+        let mut ext = vec![0x21, 0xff, 11];
+        ext.extend_from_slice(b"XMP DataXMP");
+        ext.extend_from_slice(text);
+        ext.push(1);
+        ext.extend((0..=255u8).rev());
+        ext.push(0);
+        ext
+    }
+
+    fn gif(
+        rng: &mut Rng,
+        version: &[u8; 6],
+        (width, height): (u16, u16),
+        global: Option<u8>,
+        background: u8,
+        extensions: &[Vec<u8>],
+        frames: &[FrameSpec],
+    ) -> Vec<u8> {
+        let mut out = version.to_vec();
+        out.extend(width.to_le_bytes());
+        out.extend(height.to_le_bytes());
+        out.push(global.map_or(0, |bits| 0x80 | (bits - 1)));
+        out.push(background);
+        out.push(0);
+        if let Some(bits) = global {
+            out.extend(rng.bytes(3 << bits));
+        }
+        for ext in extensions {
+            out.extend_from_slice(ext);
+        }
+        for f in frames {
+            if let Some(index) = f.transparent {
+                out.extend([0x21, 0xf9, 4, 0b1001, 7, 0, index, 0]);
+            }
+            out.push(0x2c);
+            for v in [f.left, f.top, f.width, f.height] {
+                out.extend(v.to_le_bytes());
+            }
+            let flags =
+                f.local.map_or(0, |bits| 0x80 | (bits - 1)) | if f.interlaced { 0x40 } else { 0 };
+            out.push(flags);
+            if let Some(bits) = f.local {
+                out.extend(rng.bytes(3 << bits));
+            }
+            let pixels = usize::from(f.width) * usize::from(f.height);
+            let indices: Vec<u8> = (0..pixels)
+                .map(|_| (u16::from(rng.next()) % f.below.min(256)) as u8)
+                .collect();
+            let data = weezl::encode::Encoder::new(weezl::BitOrder::Lsb, f.code_size)
+                .encode(&indices)
+                .unwrap();
+            out.push(f.code_size);
+            sub_blocks(&mut out, &data);
+        }
+        out.push(0x3b);
+        out
+    }
+
+    fn files() -> Vec<(String, Vec<u8>)> {
+        let rng = &mut Rng(7);
+        let mut files = Vec::new();
+        let mut add = |name: &str, bytes: Vec<u8>| files.push((String::from(name), bytes));
+
+        add(
+            "one pixel",
+            gif(rng, b"GIF89a", (1, 1), Some(1), 0, &[], &[frame(1, 1, 2)]),
+        );
+        add(
+            "256 colours",
+            gif(
+                rng,
+                b"GIF89a",
+                (37, 23),
+                Some(8),
+                3,
+                &[],
+                &[frame(37, 23, 8)],
+            ),
+        );
+        let mut offset = frame(20, 11, 2);
+        (offset.left, offset.top, offset.local, offset.transparent) = (9, 5, Some(2), Some(1));
+        let mut interlaced = frame(64, 48, 4);
+        interlaced.interlaced = true;
+        let mut outside = frame(40, 30, 4);
+        (outside.left, outside.top) = (50, 40);
+        add(
+            "frames",
+            gif(
+                rng,
+                b"GIF89a",
+                (64, 48),
+                Some(4),
+                1,
+                &[],
+                &[frame(64, 48, 4), offset, interlaced, outside],
+            ),
+        );
+        let mut two = frame(30, 20, 2);
+        two.local = Some(1);
+        let mut many = frame(33, 17, 7);
+        many.local = Some(7);
+        add(
+            "local palettes",
+            gif(
+                rng,
+                b"GIF89a",
+                (40, 30),
+                None,
+                0,
+                &[],
+                &[two, many.clone(), many],
+            ),
+        );
+        add(
+            "no palette",
+            gif(rng, b"GIF89a", (10, 10), None, 0, &[], &[frame(10, 10, 2)]),
+        );
+        let sizes: Vec<FrameSpec> = (2..=11).map(|size| frame(29, 13, size)).collect();
+        add(
+            "every code size",
+            gif(rng, b"GIF89a", (29, 13), Some(8), 0, &[], &sizes),
+        );
+        let mut reversed = sizes.clone();
+        reversed.reverse();
+        add(
+            "every code size, reversed",
+            gif(rng, b"GIF89a", (29, 13), Some(8), 0, &[], &reversed),
+        );
+        let text = b"<x:xmpmeta xmlns:x='adobe:ns:meta/'><rdf:RDF/></x:xmpmeta>".repeat(9);
+        let metadata = [
+            application(b"NETSCAPE2.0", &[1, 3, 0]),
+            vec![0x21, 0xfe, 5, b'h', b'e', b'l', b'l', b'o', 0],
+            xmp(&text),
+            application(b"ICCRGBG1012", &rng.bytes(700)),
+            application(b"SOMETHING12", &rng.bytes(40)),
+        ];
+        add(
+            "metadata",
+            gif(
+                rng,
+                b"GIF89a",
+                (16, 16),
+                Some(3),
+                2,
+                &metadata,
+                &[frame(16, 16, 3)],
+            ),
+        );
+        let twice = [
+            xmp(b"first"),
+            xmp(&text),
+            application(b"ICCRGBG1012", &rng.bytes(20)),
+        ];
+        add(
+            "two packets",
+            gif(
+                rng,
+                b"GIF89a",
+                (16, 16),
+                Some(3),
+                2,
+                &twice,
+                &[frame(16, 16, 3)],
+            ),
+        );
+        add(
+            "empty frame",
+            gif(
+                rng,
+                b"GIF89a",
+                (8, 8),
+                Some(2),
+                0,
+                &[],
+                &[frame(0, 0, 2), frame(8, 8, 2)],
+            ),
+        );
+        add(
+            "background past the palette",
+            gif(rng, b"GIF89a", (8, 8), Some(1), 9, &[], &[frame(8, 8, 2)]),
+        );
+        let unknown = [vec![0x21, 0x99, 2, 1, 2, 0]];
+        add(
+            "unknown extension",
+            gif(
+                rng,
+                b"GIF89a",
+                (8, 8),
+                Some(1),
+                0,
+                &unknown,
+                &[frame(8, 8, 2)],
+            ),
+        );
+        add(
+            "87a",
+            gif(rng, b"GIF87a", (12, 9), Some(5), 0, &[], &[frame(12, 9, 5)]),
+        );
+        let mut past = frame(24, 24, 6);
+        past.below = 64;
+        add(
+            "indices past the palette",
+            gif(rng, b"GIF89a", (24, 24), Some(4), 0, &[], &[past]),
+        );
+        let mut large = frame(300, 200, 8);
+        large.interlaced = true;
+        add(
+            "large",
+            gif(
+                rng,
+                b"GIF89a",
+                (300, 200),
+                Some(8),
+                0,
+                &[],
+                &[large, frame(300, 200, 8)],
+            ),
+        );
+
+        // Damaged copies: cut short, and with bytes changed.
+        let mut damaged = Vec::new();
+        for (name, bytes) in &files {
+            let len = bytes.len();
+            for cut in [7, 13, len / 3, len / 2, len - 2] {
+                if cut < len {
+                    damaged.push((format!("{name} cut at {cut}"), bytes[..cut].to_vec()));
+                }
+            }
+            for (at, xor) in [
+                (10, 0x07),
+                (len / 3, 0x5a),
+                (len / 2 + 1, 0xff),
+                (len - 3, 0x80),
+            ] {
+                let mut bytes = bytes.clone();
+                bytes[at] ^= xor;
+                damaged.push((format!("{name} changed at {at}"), bytes));
+            }
+        }
+        files.extend(damaged);
+        files
+    }
+
+    /// How the decoder is configured and read.
+    #[derive(Clone, Copy, Debug)]
+    enum Mode {
+        /// As the app reads it: RGBA, `next_frame_info` and `read_into_buffer`.
+        Into,
+        /// `read_next_frame`, RGBA.
+        NextRgba,
+        /// `read_next_frame`, indices.
+        NextIndexed,
+        /// `read_next_frame`, LZW data kept.
+        Lzw,
+        /// `read_next_frame`, with each other option set and a small memory limit.
+        Strict,
+    }
+
+    const MODES: [Mode; 5] = [
+        Mode::Into,
+        Mode::NextRgba,
+        Mode::NextIndexed,
+        Mode::Lzw,
+        Mode::Strict,
+    ];
+
+    fn options(mode: Mode) -> DecodeOptions {
+        let mut options = DecodeOptions::new();
+        match mode {
+            Mode::Into | Mode::NextRgba => options.set_color_output(ColorOutput::RGBA),
+            Mode::NextIndexed => {}
+            Mode::Lzw => options.skip_frame_decoding(true),
+            Mode::Strict => {
+                options.set_color_output(ColorOutput::RGBA);
+                options.check_frame_consistency(true);
+                options.check_lzw_end_code(true);
+                options.allow_unknown_blocks(true);
+                options.set_memory_limit(MemoryLimit::Bytes(5000.try_into().unwrap()));
+            }
+        }
+        options
+    }
+
+    /// Everything a decoder gives, in order.
+    fn read<R: Read, B: BufRead>(decoder: &mut Decoder<R, B>, mode: Mode) -> Vec<String> {
+        let mut log = vec![format!(
+            "{}×{} background {:?} repeat {:?} palette {:?}",
+            decoder.width(),
+            decoder.height(),
+            decoder.bg_color(),
+            decoder.repeat(),
+            decoder.global_palette()
+        )];
+        for _ in 0..16 {
+            if let Mode::Into = mode {
+                match decoder.next_frame_info() {
+                    Ok(Some(frame)) => log.push(format!("{frame:?}")),
+                    Ok(None) => break,
+                    Err(err) => {
+                        log.push(format!("{err:?}"));
+                        break;
+                    }
+                }
+                let size = decoder.buffer_size();
+                if size > 1 << 22 {
+                    log.push(format!("{size} bytes"));
+                    break;
+                }
+                let mut buf = vec![0; size];
+                let result = decoder.read_into_buffer(&mut buf);
+                log.push(format!("{result:?} {buf:?}"));
+                if result.is_err() {
+                    break;
+                }
+            } else {
+                match decoder.read_next_frame() {
+                    Ok(Some(frame)) => log.push(format!("{frame:?}")),
+                    Ok(None) => break,
+                    Err(err) => {
+                        log.push(format!("{err:?}"));
+                        break;
+                    }
+                }
+            }
+            log.push(format!(
+                "{:?} {:?}",
+                decoder.palette(),
+                decoder.current_frame_info()
+            ));
+        }
+        log.push(format!(
+            "{:?} {:?}",
+            decoder.xmp_metadata(),
+            decoder.icc_profile()
+        ));
+        log
+    }
+
+    /// Upstream's way: a decoder over a new `BufReader`.
+    fn reference(bytes: &[u8], mode: Mode) -> Vec<String> {
+        catch_unwind(|| match options(mode).read_info(Cursor::new(bytes)) {
+            Ok(mut decoder) => read(&mut decoder, mode),
+            Err(err) => vec![format!("{err:?}")],
+        })
+        .unwrap_or_else(|_| vec![String::from("panicked")])
+    }
+
+    fn kept<B: BufRead>(reader: B, mode: Mode, scratch: Scratch) -> (Vec<String>, Scratch) {
+        catch_unwind(AssertUnwindSafe(|| {
+            match options(mode).read_info_with(reader, scratch) {
+                Ok(mut decoder) => {
+                    let log = read(&mut decoder, mode);
+                    (log, decoder.into_scratch())
+                }
+                Err((err, scratch)) => (vec![format!("{err:?}")], scratch),
+            }
+        }))
+        .unwrap_or_else(|_| (vec![String::from("panicked")], Scratch::default()))
+    }
+
+    fn first_difference(log: &[String], expected: &[String]) -> String {
+        let line = (0..log.len().max(expected.len()))
+            .find(|&i| log.get(i) != expected.get(i))
+            .unwrap_or(0);
+        let cut = |l: Option<&String>| l.map(|l| l.chars().take(300).collect::<String>());
+        format!(
+            "line {line}: {:?} against {:?}",
+            cut(log.get(line)),
+            cut(expected.get(line))
+        )
+    }
+
+    /// A log without the pixels a failed read left in its buffer: how far a read gets before it fails depends on
+    /// where its input is cut, in upstream's decoder too.
+    fn without_partial_pixels(log: &[String]) -> Vec<String> {
+        let cut = |line: &String| match line.split_once(" [") {
+            Some((result, _)) if line.starts_with("Err(") => String::from(result),
+            _ => line.clone(),
+        };
+        log.iter().map(cut).collect()
+    }
+
+    #[test]
+    fn kept_buffers_read_as_new_ones() {
+        let files = files();
+        let cases: Vec<(usize, Mode)> = (0..files.len())
+            .flat_map(|i| MODES.iter().map(move |&mode| (i, mode)))
+            .collect();
+        let chunks = |bytes: &[u8]| BufReader::with_capacity(5, Cursor::new(bytes.to_vec()));
+        let mut upstream = Vec::new();
+        let (mut direct, mut chunked) = (Vec::new(), Vec::new());
+        for &(i, mode) in &cases {
+            let bytes = files[i].1.as_slice();
+            upstream.push(reference(bytes, mode));
+            direct.push(kept(Cursor::new(bytes), mode, Scratch::default()).0);
+            chunked.push(kept(chunks(bytes), mode, Scratch::default()).0);
+        }
+
+        // Files read whole, fail, and fail late: these are no vacuous comparisons.
+        let errors = upstream
+            .iter()
+            .filter(|log| log.iter().any(|l| l.contains("Err") || l.contains("Error")))
+            .count();
+        let whole = upstream
+            .iter()
+            .filter(|log| log.len() > 4 && !log.iter().any(|l| l.contains("Err")))
+            .count();
+        let first = upstream.iter().filter(|log| log.len() == 1).count();
+        assert!(
+            whole > 150 && errors > 150 && first > 20,
+            "{whole} {errors} {first}"
+        );
+
+        // A new decoder over the file as it is reads as upstream's over its `BufReader`, and in 5-byte pieces too,
+        // but where the end code is checked (whether a missing one is found depends on where the input is cut).
+        for (c, &(i, mode)) in cases.iter().enumerate() {
+            let name = &files[i].0;
+            let expected = without_partial_pixels(&upstream[c]);
+            let log = without_partial_pixels(&direct[c]);
+            assert!(
+                log == expected,
+                "{name}, {mode:?}: {}",
+                first_difference(&log, &expected)
+            );
+            let log = without_partial_pixels(&chunked[c]);
+            if log != expected {
+                assert!(
+                    matches!(mode, Mode::Strict),
+                    "{name}, {mode:?} in 5-byte reads: {}",
+                    first_difference(&log, &expected)
+                );
+            }
+        }
+        // photo-gallery: the counts this test printed on every run (partial pixels, end codes) are
+        // no longer printed or counted; the checks above are the test.
+
+        // A decoder in kept buffers reads exactly as a new one over the same reader, partial pixels included.
+        let order: Vec<usize> = (0..cases.len()).chain((0..cases.len()).rev()).collect();
+        for trim in [None, Some(0), Some(600)] {
+            let (mut over_file, mut over_chunks) = (Scratch::default(), Scratch::default());
+            for &c in &order {
+                let (i, mode) = cases[c];
+                let (name, bytes) = &files[i];
+                let (log, scratch) = kept(Cursor::new(bytes.as_slice()), mode, over_file);
+                assert!(
+                    log == direct[c],
+                    "{name}, {mode:?}, trimmed at {trim:?}: {}",
+                    first_difference(&log, &direct[c])
+                );
+                over_file = scratch;
+                let (log, scratch) = kept(chunks(bytes), mode, over_chunks);
+                assert!(
+                    log == chunked[c],
+                    "{name}, {mode:?} in 5-byte reads, trimmed at {trim:?}: {}",
+                    first_difference(&log, &chunked[c])
+                );
+                over_chunks = scratch;
+                if let Some(bytes) = trim {
+                    over_file.trim(bytes);
+                    over_chunks.trim(bytes);
+                }
+            }
         }
     }
 }
